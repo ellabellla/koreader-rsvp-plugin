@@ -189,6 +189,10 @@ function FastReader:init()
     end
     self.punctuation_pause_multiplier = self.settings:readSetting("punctuation_pause_multiplier") or 1.5
 
+    -- RSVP font: a crengine face name, or nil for the built-in default fonts
+    self.rsvp_font_face = self.settings:readSetting("rsvp_font_face")
+    self.rsvp_font_size = self.settings:readSetting("rsvp_font_size") or 28
+
     -- Position tracking for resume functionality
     self.last_page_hash = nil -- Hash to identify current page content
     self.last_word_index = 1  -- Last read word index on this page
@@ -212,8 +216,80 @@ function FastReader:saveSettings()
         self.settings:saveSetting("ovp_alignment_enabled", self.ovp_alignment_enabled)
         self.settings:saveSetting("punctuation_pause_enabled", self.punctuation_pause_enabled)
         self.settings:saveSetting("punctuation_pause_multiplier", self.punctuation_pause_multiplier)
+        self.settings:saveSetting("rsvp_font_face", self.rsvp_font_face)
+        self.settings:saveSetting("rsvp_font_size", self.rsvp_font_size)
         self.settings:flush()
     end
+end
+
+-- Returns a font file and face index for the chosen RSVP font, or nil for the default fonts
+function FastReader:getRSVPFontFile()
+    if not self.rsvp_font_face then
+        return nil
+    end
+    local ok, filename, faceindex = pcall(function()
+        local cre = require("document/credocument"):engineInit()
+        return cre.getFontFaceFilenameAndFaceIndex(self.rsvp_font_face)
+    end)
+    if ok and filename then
+        return filename, faceindex
+    end
+    logger.warn("FastReader: RSVP font not found, using default: " .. tostring(self.rsvp_font_face))
+    return nil
+end
+
+-- Font submenu: Default, then the same faces as the book font menu (Typeset > Font)
+function FastReader:getFontMenuItems()
+    local items = {
+        {
+            text = _("Default"),
+            radio = true,
+            checked_func = function()
+                return self.rsvp_font_face == nil
+            end,
+            callback = function()
+                self.rsvp_font_face = nil
+                self:saveSettings()
+            end,
+            separator = true,
+        },
+    }
+
+    local ok, err = pcall(function()
+        local cre = require("document/credocument"):engineInit()
+        local FontList = require("fontlist")
+        local faces = cre.getFontFaces()
+        table.sort(faces, function(a, b) return a:lower() < b:lower() end)
+        for _, face in ipairs(faces) do
+            local filename, faceindex, is_monospace = cre.getFontFaceFilenameAndFaceIndex(face)
+            local name = filename and FontList:getLocalizedFontName(filename, faceindex) or face
+            if is_monospace then
+                name = name .. " 🄼"
+            end
+            table.insert(items, {
+                text = name,
+                radio = true,
+                font_func = filename and function(size)
+                    return Font:getFace(filename, size, faceindex)
+                end or nil,
+                checked_func = function()
+                    return self.rsvp_font_face == face
+                end,
+                callback = function()
+                    self.rsvp_font_face = face
+                    self:saveSettings()
+                end,
+            })
+        end
+    end)
+    if not ok then
+        logger.warn("FastReader: Could not load font list: " .. tostring(err))
+        UIManager:show(InfoMessage:new{
+            text = _("Could not load font list"),
+            timeout = 3,
+        })
+    end
+    return items
 end
 
 function FastReader:enableContinuousView()
@@ -474,7 +550,10 @@ function RSVPWidget:updateDimensions(new_dimen)
     local min_width = math.min(Screen:scaleBySize(320), max_width)
     fixed_width = math.max(fixed_width, min_width)
     fixed_width = math.min(fixed_width, max_width)
-    local fixed_height = Screen:scaleBySize(120)
+    -- Layout constants below were tuned for the default 28pt font; scale them with the chosen size
+    local font_size = self.plugin.rsvp_font_size or 28
+    self.size_scale = font_size / 28
+    local fixed_height = Screen:scaleBySize(math.max(80, 120 * self.size_scale))
     local frame_x = math.floor((sw - fixed_width) / 2)
     local frame_y = math.floor((sh - fixed_height) / 2)
 
@@ -488,9 +567,20 @@ function RSVPWidget:updateDimensions(new_dimen)
     self.text_padding = Screen:scaleBySize(20)
     self.inter_word_gap = Screen:scaleBySize(15)
 
-    local base_font_name = self.plugin.ovp_alignment_enabled and "infont" or "cfont"
-    self.anchor_face = Font:getFace(base_font_name, 28)
-    self.secondary_face = Font:getFace(base_font_name, 24)
+    local secondary_size = math.floor(font_size * 24 / 28 + 0.5)
+    local anchor_face, secondary_face
+    local font_file, font_faceindex = self.plugin:getRSVPFontFile()
+    if font_file then
+        anchor_face = Font:getFace(font_file, font_size, font_faceindex)
+        secondary_face = Font:getFace(font_file, secondary_size, font_faceindex)
+    end
+    if not anchor_face or not secondary_face then
+        local base_font_name = self.plugin.ovp_alignment_enabled and "infont" or "cfont"
+        anchor_face = Font:getFace(base_font_name, font_size)
+        secondary_face = Font:getFace(base_font_name, secondary_size)
+    end
+    self.anchor_face = anchor_face
+    self.secondary_face = secondary_face
 
     self.ges_events = {
         Tap = {
@@ -623,8 +713,9 @@ function RSVPWidget:paintTo(bb, x, y)
     local anchor_face = self.anchor_face
     local inter_word_gap = self.inter_word_gap
     local min_left_padding = Screen:scaleBySize(20)
-    local base_right_padding = (preview_count <= 2) and Screen:scaleBySize(140) or Screen:scaleBySize(180)
-    base_right_padding = math.max(Screen:scaleBySize(80), math.min(base_right_padding, math.floor(inner_w * 0.6)))
+    local size_scale = self.size_scale or 1
+    local base_right_padding = Screen:scaleBySize(((preview_count <= 2) and 140 or 180) * size_scale)
+    base_right_padding = math.max(Screen:scaleBySize(80 * size_scale), math.min(base_right_padding, math.floor(inner_w * 0.6)))
 
     local anchor_offset = 0
     if self.plugin.ovp_alignment_enabled then
@@ -633,9 +724,9 @@ function RSVPWidget:paintTo(bb, x, y)
 
     local anchor_target
     if self.plugin.ovp_alignment_enabled then
-        local target_limit = Screen:scaleBySize((preview_count <= 2) and 90 or 140)
+        local target_limit = Screen:scaleBySize(((preview_count <= 2) and 90 or 140) * size_scale)
         anchor_target = math.min(inner_w - base_right_padding, target_limit)
-        anchor_target = math.max(anchor_target, Screen:scaleBySize(90))
+        anchor_target = math.max(anchor_target, Screen:scaleBySize(90 * size_scale))
     else
         anchor_target = math.floor(inner_w / 2)
     end
@@ -704,7 +795,7 @@ function RSVPWidget:paintTo(bb, x, y)
     if self.plugin.ovp_alignment_enabled then
         local crosshair_x = math.floor(word_x + anchor_offset)
         crosshair_x = math.max(inner_x + 1, math.min(crosshair_x, inner_x + inner_w - 2))
-        local guide_h = Screen:scaleBySize(12)
+        local guide_h = Screen:scaleBySize(12 * size_scale)
         -- Top guide tick at fixation point
         bb:paintRect(crosshair_x - 1, inner_y, 2, guide_h, Blitbuffer.COLOR_BLACK)
         -- Bottom guide tick at fixation point
@@ -1170,6 +1261,42 @@ function FastReader:addToMainMenu(menu_items)
                     UIManager:show(spin_widget)
                 end,
                 help_text = _("Multiplier applied to a word's display time when it ends in punctuation. 1.0 means no extra pause."),
+            },
+            {
+                text_func = function()
+                    return T(_("Font: %1"), self.rsvp_font_face or _("Default"))
+                end,
+                sub_item_table_func = function()
+                    return self:getFontMenuItems()
+                end,
+                help_text = _("Font used in the RSVP widget. Lists the same fonts as the book font menu. Thin or light fonts may look ragged while words are playing on e-ink."),
+            },
+            {
+                text_func = function()
+                    return T(_("Font Size: %1"), self.rsvp_font_size)
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    local spin_widget = SpinWidget:new{
+                        title_text = _("RSVP Font Size"),
+                        info_text = _("Size of the current word (16-72). Preview words are slightly smaller."),
+                        width = math.floor(Screen:getWidth() * 0.6),
+                        value = self.rsvp_font_size,
+                        value_min = 16,
+                        value_max = 72,
+                        value_step = 1,
+                        value_hold_step = 4,
+                        default_value = 28,
+                        callback = function(spin)
+                            self.rsvp_font_size = spin.value
+                            self:saveSettings()
+                            touchmenu_instance:updateItems()
+                        end
+                    }
+                    UIManager:show(spin_widget)
+                end,
+                help_text = _("Size of the RSVP text. The widget grows to fit larger sizes."),
             },
             {
                 text_func = function()

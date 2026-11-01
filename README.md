@@ -10,6 +10,7 @@ A powerful RSVP (Rapid Serial Visual Presentation) plugin that enables speed rea
 - Flexible Speed Control: Adjustable reading speed from 50 to 1000 WPM
 - Multi-Word Preview: Display multiple words simultaneously (1-10 words configurable)
 - Pause on Punctuation: Shows punctuation and holds words ending in it longer (adjustable)
+- Font and Size Selection: Pick any font from the book font list and set the RSVP text size
 - Optimal View Point Alignment: Optionally anchor each word on a focus crosshair for faster fixation
 - Fixed-Width Display: Stable reading widget that doesn't "jump" between words
 - Position Tracking: Visual indicator shows reading progress when resuming
@@ -60,6 +61,8 @@ Reading on 400 words per second
 - **Optimal Alignment (OVP)**: Align words around the focus crosshair (monospace) or center them with standard spacing
 - **Pause on Punctuation**: Show punctuation and hold words ending in `. , ; : ! ? … —` longer. Spaced-out ellipses (`wait . . .`) are grouped with their word. Abbreviations such as `Mr.` also pause
 - **Punctuation Pause**: How much longer those words stay on screen (1.0-4.0×, default 1.5×)
+- **Font**: Font for the RSVP widget. Lists the same fonts as the book font menu, plus Default (monospace with OVP on, the UI font with OVP off). Thin or light fonts can look ragged while words are playing on e-ink, and clean when paused
+- **Font Size**: Size of the current word (16-72, default 28). Preview words are slightly smaller and the widget grows to fit
 - **RSVP Speed**: Comprehensive speed control options
 
 ### Speed Presets
