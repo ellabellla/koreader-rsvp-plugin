@@ -101,6 +101,18 @@ local function endsWithPausePunctuation(word)
     return i > 0 and PAUSE_CHARS[chars[i]] == true
 end
 
+-- Number of letters in text, ignoring punctuation, whitespace and soft hyphens.
+-- Used to line our words up with the document's own words, which may be split differently.
+local function countLetters(text)
+    local n = 0
+    for _, ch in ipairs(util.splitToChars(text or "")) do
+        if not isPunctuationChar(ch) and not ch:match("^%s$") and ch ~= "\194\173" then
+            n = n + 1
+        end
+    end
+    return n
+end
+
 -- Split text into words, keeping their punctuation. Standalone ellipses and
 -- dashes ("wait . . ." / "said —") are attached to the previous word; other
 -- punctuation-only tokens are dropped. Shared by page extraction and
@@ -204,6 +216,10 @@ function FastReader:init()
     else
         self.hyphenate_long_words = hyphenate_setting
     end
+    -- Highlight on stop: "off", "replace" (move the previous one) or "keep" (keep all)
+    self.highlight_on_stop = self.settings:readSetting("highlight_on_stop") or "replace"
+    self.highlight_style = self.settings:readSetting("highlight_style") or "lighten"
+    self.highlight_color = self.settings:readSetting("highlight_color") or "red"
     local split_setting = self.settings:readSetting("split_hyphenated_words")
     if split_setting == nil then
         self.split_hyphenated_words = true
@@ -239,6 +255,9 @@ function FastReader:saveSettings()
         self.settings:saveSetting("ovp_offset_letters", self.ovp_offset_letters)
         self.settings:saveSetting("hyphenate_long_words", self.hyphenate_long_words)
         self.settings:saveSetting("split_hyphenated_words", self.split_hyphenated_words)
+        self.settings:saveSetting("highlight_on_stop", self.highlight_on_stop)
+        self.settings:saveSetting("highlight_style", self.highlight_style)
+        self.settings:saveSetting("highlight_color", self.highlight_color)
         self.settings:flush()
     end
 end
@@ -257,6 +276,73 @@ function FastReader:getRSVPFontFile()
     end
     logger.warn("FastReader: RSVP font not found, using default: " .. tostring(self.rsvp_font_face))
     return nil
+end
+
+-- Highlight on Stop submenu: mode, then style and color
+function FastReader:getHighlightMenuItems()
+    local function radio(text, get, set, value)
+        return {
+            text = text,
+            radio = true,
+            checked_func = function()
+                return get() == value
+            end,
+            callback = function()
+                set(value)
+                self:saveSettings()
+            end,
+        }
+    end
+    local function highlightEnabled()
+        return self.highlight_on_stop ~= "off"
+    end
+
+    local get_mode = function() return self.highlight_on_stop end
+    local set_mode = function(v) self.highlight_on_stop = v end
+    local items = {
+        radio(_("Off"), get_mode, set_mode, "off"),
+        radio(_("Replace previous"), get_mode, set_mode, "replace"),
+        radio(_("Keep all"), get_mode, set_mode, "keep"),
+    }
+    items[#items].separator = true
+
+    local get_style = function() return self.highlight_style end
+    local set_style = function(v) self.highlight_style = v end
+    local style_labels = { lighten = _("Color"), underscore = _("Underline") }
+    table.insert(items, {
+        text_func = function()
+            return T(_("Style: %1"), style_labels[self.highlight_style] or self.highlight_style)
+        end,
+        enabled_func = highlightEnabled,
+        sub_item_table = {
+            radio(_("Color"), get_style, set_style, "lighten"),
+            radio(_("Underline"), get_style, set_style, "underscore"),
+        },
+    })
+
+    -- Same color names as KOReader's own highlights
+    local colors = {
+        { _("Red"), "red" }, { _("Orange"), "orange" }, { _("Yellow"), "yellow" },
+        { _("Green"), "green" }, { _("Olive"), "olive" }, { _("Cyan"), "cyan" },
+        { _("Blue"), "blue" }, { _("Purple"), "purple" }, { _("Gray"), "gray" },
+    }
+    local get_color = function() return self.highlight_color end
+    local set_color = function(v) self.highlight_color = v end
+    local color_items = {}
+    local color_labels = {}
+    for _, c in ipairs(colors) do
+        table.insert(color_items, radio(c[1], get_color, set_color, c[2]))
+        color_labels[c[2]] = c[1]
+    end
+    table.insert(items, {
+        text_func = function()
+            return T(_("Color: %1"), color_labels[self.highlight_color] or self.highlight_color)
+        end,
+        enabled_func = highlightEnabled,
+        sub_item_table = color_items,
+        help_text = _("Colors show on color screens; black-and-white screens show them as gray."),
+    })
+    return items
 end
 
 -- Font submenu: Default, then the same faces as the book font menu (Typeset > Font)
@@ -355,6 +441,7 @@ function FastReader:extractWordsFromCurrentPage()
     
     local text = ""
     local debug_info = {}
+    self.page_start_xp = nil
     
     logger.info("FastReader: Starting text extraction")
     logger.info("FastReader: Document type: " .. tostring(self.ui.document.provider))
@@ -374,6 +461,8 @@ function FastReader:extractWordsFromCurrentPage()
             
             if res and res.text then
                 logger.info("FastReader: getTextFromPositions success: " .. string.len(res.text) .. " characters")
+                -- Where this page's text starts, used to locate a word for highlighting
+                self.page_start_xp = res.pos0
                 return res.text
             else
                 logger.warn("FastReader: getTextFromPositions returned empty result")
@@ -815,7 +904,7 @@ end
 function RSVPWidget:onHold(arg, ges)
     -- Long press only stops once paused, so a stray hold while reading is harmless
     if self.plugin.rsvp_paused then
-        self.plugin:stopRSVP()
+        self.plugin:stopRSVP({ user_initiated = true })
     end
     return true
 end
@@ -830,7 +919,7 @@ function RSVPWidget:onTogglePause()
 end
 
 function RSVPWidget:onClose()
-    self.plugin:stopRSVP()
+    self.plugin:stopRSVP({ user_initiated = true })
     return true
 end
 
@@ -1122,6 +1211,170 @@ function FastReader:getHyphenation(segment)
     return nil
 end
 
+-- Letter range (first, last) of the current word within the page's letters
+function FastReader:getCurrentWordLetterRange()
+    local offset = 0
+    for i = 1, self.current_word_index - 1 do
+        offset = offset + countLetters(self.words[i])
+    end
+    local len = countLetters(self.words[self.current_word_index])
+    if len == 0 then
+        return nil
+    end
+    return offset + 1, offset + len
+end
+
+-- Locate the current word in the document, as a selection ReaderHighlight can save
+function FastReader:locateCurrentWord()
+    local first, last = self:getCurrentWordLetterRange()
+    if not first then
+        return nil
+    end
+    local doc = self.ui.document
+
+    if self.ui.rolling then
+        -- Walk the document's words from the start of the page, counting letters
+        local s = self.page_start_xp
+        local count, pos0, pos1 = 0, nil, nil
+        for _ = 1, 10000 do
+            if not s then
+                break
+            end
+            local e = doc:getNextVisibleWordEnd(s)
+            if not e then
+                break
+            end
+            local n = countLetters(doc:getTextFromXPointers(s, e))
+            if n > 0 then
+                if not pos0 and count + n >= first then
+                    pos0 = s
+                end
+                count = count + n
+                if count >= last then
+                    pos1 = e
+                    break
+                end
+            end
+            local next_s = doc:getNextVisibleWordStart(s)
+            if next_s == s then
+                break
+            end
+            s = next_s
+        end
+        if pos0 and pos1 then
+            return { pos0 = pos0, pos1 = pos1, text = doc:getTextFromXPointers(pos0, pos1) }
+        end
+        return nil
+    end
+
+    -- Paging: walk the page's word boxes, the same boxes the page text was built from
+    local page = self.ui.paging.current_page
+    local boxes = doc:getTextBoxes(page)
+    if not boxes then
+        return nil
+    end
+    local count, first_box, last_box = 0, nil, nil
+    for _, line in ipairs(boxes) do
+        for _, box in ipairs(line) do
+            local n = countLetters(box.word)
+            if n > 0 then
+                if not first_box and count + n >= first then
+                    first_box = box
+                end
+                count = count + n
+                if count >= last then
+                    last_box = box
+                    break
+                end
+            end
+        end
+        if last_box then
+            break
+        end
+    end
+    if not (first_box and last_box) then
+        return nil
+    end
+    local function centre(box)
+        return { x = (box.x0 + box.x1) / 2, y = (box.y0 + box.y1) / 2, page = page }
+    end
+    local res = doc:getTextFromPositions(centre(first_box), centre(last_box))
+    if not (res and res.pos0 and res.pos1) then
+        return nil
+    end
+    return { pos0 = res.pos0, pos1 = res.pos1, text = res.text, pboxes = res.pboxes }
+end
+
+local function samePosition(a, b)
+    if type(a) == "table" and type(b) == "table" then
+        return a.page == b.page and a.x == b.x and a.y == b.y
+    end
+    return a == b
+end
+
+-- Highlight the current word on stop, replacing the plugin's previous highlight
+-- in "replace" mode. Returns true if annotations changed.
+function FastReader:highlightCurrentWord()
+    if self.highlight_on_stop == "off" or not self.ui.highlight or not self.ui.annotation then
+        return false
+    end
+    local ok, result = pcall(function()
+        local loc = self:locateCurrentWord()
+        if not loc then
+            logger.warn("FastReader: Could not locate current word for highlight")
+            return false
+        end
+
+        local annotations = self.ui.annotation.annotations
+        local stored = self.ui.doc_settings:readSetting("fastreader_stop_highlight")
+        if self.highlight_on_stop == "replace" and stored then
+            -- Find our previous highlight, if it still exists and the user hasn't edited it
+            for i, item in ipairs(annotations) do
+                if item.drawer and item.datetime == stored.datetime and samePosition(item.pos0, stored.pos0) then
+                    if not item.note and not item.datetime_updated
+                            and item.color == stored.color and item.drawer == stored.drawer then
+                        if samePosition(item.pos0, loc.pos0) and samePosition(item.pos1, loc.pos1)
+                                and item.color == self.highlight_color and item.drawer == self.highlight_style then
+                            return false -- already highlighted, nothing to do
+                        end
+                        self.ui.highlight:deleteHighlight(i)
+                    end
+                    break
+                end
+            end
+        end
+
+        self.ui.highlight.selected_text = {
+            text = loc.text or self.words[self.current_word_index],
+            pos0 = loc.pos0,
+            pos1 = loc.pos1,
+            pboxes = loc.pboxes,
+            drawer = self.highlight_style,
+            color = self.highlight_color,
+        }
+        local index = self.ui.highlight:saveHighlight()
+        self.ui.highlight.selected_text = nil
+        local item = index and annotations[index]
+        if item then
+            self.ui.doc_settings:saveSetting("fastreader_stop_highlight", {
+                datetime = item.datetime,
+                pos0 = item.pos0,
+                color = item.color,
+                drawer = item.drawer,
+            })
+        end
+        return true
+    end)
+    if not ok then
+        logger.warn("FastReader: Highlight on stop failed: " .. tostring(result))
+        if self.ui.highlight then
+            self.ui.highlight.selected_text = nil
+        end
+        return false
+    end
+    return result
+end
+
 function FastReader:scheduleNextTick()
     if self.rsvp_timer then
         UIManager:unschedule(self.rsvp_timer)
@@ -1214,6 +1467,7 @@ function FastReader:startRSVP(opts)
     self.rsvp_enabled = true
     -- Always open paused on the start word: tap to play, long press to close
     self.rsvp_paused = true
+    self.rsvp_has_played = false
     self.current_chunk_index = 1
 
     -- A tapped word overrides the saved resume position
@@ -1243,12 +1497,20 @@ function FastReader:startRSVP(opts)
     logger.info("FastReader: RSVP started successfully")
 end
 
-function FastReader:stopRSVP()
+-- opts.user_initiated: stopped by the user (long press, Back, menu), not by reaching
+-- the end of the document or closing the book. Only those stops add a highlight.
+function FastReader:stopRSVP(opts)
     if not self.rsvp_enabled then
         return
     end
-    
+
     logger.info("FastReader: Stopping RSVP mode")
+
+    -- Highlight the current word, only if the user stopped after actually reading
+    local highlighted = false
+    if opts and opts.user_initiated and self.rsvp_has_played then
+        highlighted = self:highlightCurrentWord()
+    end
     
     -- Save current position before stopping
     if #self.words > 0 and self.current_word_index > 1 then
@@ -1273,7 +1535,13 @@ function FastReader:stopRSVP()
     if self.rsvp_widget then
         self.rsvp_widget:freeWidgets()
         local refresh_region = self.rsvp_widget.box_dimen or self.rsvp_widget.dimen
-        -- Flash the box region on close to clear ghosting left by the "fast" word refreshes
+        if highlighted then
+            -- The highlight (and any removed one) can be anywhere on the page: repaint the
+            -- page and flash the whole screen once, which also clears the box's ghosting
+            UIManager:setDirty(self.ui.dialog or self.ui)
+            refresh_region = nil
+        end
+        -- Flash on close to clear ghosting left by the "fast" word refreshes
         UIManager:close(self.rsvp_widget, "flashui", refresh_region)
         self.rsvp_widget = nil
     end
@@ -1289,6 +1557,7 @@ function FastReader:rsvpTick()
     if not self.rsvp_enabled or self.rsvp_paused or #self.words == 0 then
         return
     end
+    self.rsvp_has_played = true
 
     -- Show the next chunk of a hyphenated word before moving on
     if self.current_chunk_index < #self:getCurrentChunks() then
@@ -1402,7 +1671,7 @@ end
 
 function FastReader:toggleRSVP()
     if self.rsvp_enabled then
-        self:stopRSVP()
+        self:stopRSVP({ user_initiated = true })
     else
         self:startRSVP()
     end
@@ -1540,6 +1809,16 @@ function FastReader:addToMainMenu(menu_items)
                     self:saveSettings()
                 end,
                 help_text = _("Shows the parts of hyphenated compound words one after another (well- / known), splitting at hyphens and em dashes. Words with a one-letter part, like e-mail, stay whole."),
+            },
+            {
+                text_func = function()
+                    local labels = { off = _("Off"), replace = _("Replace previous"), keep = _("Keep all") }
+                    return T(_("Highlight on Stop: %1"), labels[self.highlight_on_stop] or self.highlight_on_stop)
+                end,
+                sub_item_table_func = function()
+                    return self:getHighlightMenuItems()
+                end,
+                help_text = _("When you stop RSVP after reading (long press, Back or the menu), highlight the word you stopped on. Replace previous moves the highlight each time; Keep all leaves every one. A highlight you've edited is never removed."),
             },
             {
                 text = _("Pause on Punctuation"),
@@ -1793,7 +2072,7 @@ function FastReader:onKeyPress(key)
     end
     
     if key == "Menu" or key == "Back" then
-        self:stopRSVP()
+        self:stopRSVP({ user_initiated = true })
         return true
     elseif key == "Press" or key == "LPgFwd" then
         self:togglePause()

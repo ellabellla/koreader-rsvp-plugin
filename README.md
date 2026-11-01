@@ -9,6 +9,7 @@ A powerful RSVP (Rapid Serial Visual Presentation) plugin that enables speed rea
 - Resume Reading: Automatically remembers your last reading position on each page
 - Flexible Speed Control: Adjustable reading speed from 50 to 1000 WPM
 - Multi-Word Preview: Display multiple words simultaneously (1-10 words configurable)
+- Highlight on Stop: Marks the word you stopped on with a colored highlight or underline, replacing the previous one
 - Pause on Punctuation: Shows punctuation and holds words ending in it longer (adjustable)
 - Font and Size Selection: Pick any font from the book font list and set the RSVP text size
 - Optimal View Point Alignment: Optionally anchor each word on a focus crosshair for faster fixation
@@ -63,6 +64,7 @@ Reading on 400 words per second
 - **OVP Offset**: Distance of the crosshair from the left edge, in average letter widths of the RSVP font (2-10, default 6.5). 6.5 fits the start of nearly every word
 - **Hyphenate Long Words**: Words too long for the widget are split into hyphenated parts shown one after another, at the word's own hyphens or the book's hyphenation dictionary break points (on by default)
 - **Split Hyphenated Words**: Compound words are shown part by part (`well-` then `known`), splitting at hyphens and em dashes, for easier reading. Words with a one-letter part such as `e-mail` stay whole (on by default)
+- **Highlight on Stop**: When you stop after reading (long press, Back or the menu), highlight the word you stopped on. Off / Replace previous (default; moves the highlight each time, never removing one you've edited) / Keep all. **Style**: Color (default) or Underline. **Color**: any KOReader highlight color (default Red; shown as gray on black-and-white screens)
 - **Pause on Punctuation**: Show punctuation and hold words ending in `. , ; : ! ? … —` longer. Spaced-out ellipses (`wait . . .`) are grouped with their word. Abbreviations such as `Mr.` also pause
 - **Punctuation Pause**: How much longer those words stay on screen (1.0-4.0×, default 1.5×)
 - **Font**: Font for the RSVP widget. Lists the same fonts as the book font menu, plus Default (monospace with OVP on, the UI font with OVP off). Thin or light fonts can look ragged while words are playing on e-ink, and clean when paused
