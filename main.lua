@@ -18,7 +18,6 @@ local FrameContainer = require("ui/widget/container/framecontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local Font = require("ui/font")
 local Geom = require("ui/geometry")
-local RenderText = require("ui/rendertext")
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
 local Screen = Device.screen
@@ -582,12 +581,31 @@ local function getOptimalRecognitionIndex(char_count)
     return 5
 end
 
+-- Measure text exactly as TextWidget draws it: same shaping (XText/HarfBuzz) and the
+-- same real-or-synthesized bold face. RenderText metrics differ from that, which
+-- made the crosshair drift off the focus letter. One reusable widget per face/bold.
+local measure_widgets = {}
+
 local function measureTextWidth(face, text, bold)
     if not text or text == "" then
         return 0
     end
-    local metrics = RenderText:sizeUtf8Text(0, Screen:getWidth(), face, text, true, bold)
-    return math.floor(metrics.x or 0)
+    local key = tostring(face) .. (bold and ":bold" or "")
+    local widget = measure_widgets[key]
+    if widget then
+        widget:setText(text)
+    else
+        widget = TextWidget:new{ text = text, face = face, bold = bold, padding = 0 }
+        measure_widgets[key] = widget
+    end
+    return widget:getWidth()
+end
+
+local function freeMeasureWidgets()
+    for key, widget in pairs(measure_widgets) do
+        widget:free()
+        measure_widgets[key] = nil
+    end
 end
 
 local function calculateAnchorOffset(word, face, bold)
@@ -617,13 +635,12 @@ local function calculateAnchorOffset(word, face, bold)
     else
         ovp_index = getOptimalRecognitionIndex(char_count)
     end
-    local prefix_text = table.concat(chars, "", 1, ovp_index - 1)
-    local key_char = chars[ovp_index] or ""
+    -- Middle of the focus letter: halfway between the text before it and the text
+    -- through it, both measured in context so kerning between them is included
+    local before = measureTextWidth(face, table.concat(chars, "", 1, ovp_index - 1), bold)
+    local through = measureTextWidth(face, table.concat(chars, "", 1, ovp_index), bold)
 
-    local prefix_width = measureTextWidth(face, prefix_text, bold)
-    local key_width = measureTextWidth(face, key_char, bold)
-
-    return prefix_width + (key_width / 2), ovp_index
+    return (before + through) / 2, ovp_index
 end
 
 -- Positions in `core` (a list of characters) after which a word may be broken:
@@ -931,6 +948,7 @@ function RSVPWidget:freeWidgets()
         self.word_widgets = {}
     end
     self.chunk_cache = {}
+    freeMeasureWidgets()
 end
 
 -- Box-wide layout values shared by painting and the chunk fit check
