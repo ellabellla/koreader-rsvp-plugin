@@ -1071,7 +1071,8 @@ function FastReader:showRSVPWord(current_word)
             plugin = self,
         }
         self.rsvp_widget:updateWord(self.words, self.current_word_index)
-        UIManager:show(self.rsvp_widget, "fast", self.rsvp_widget.box_dimen)
+        -- Opens on a still (paused) word, so use a clean "ui" refresh rather than "fast"
+        UIManager:show(self.rsvp_widget, "ui", self.rsvp_widget.box_dimen)
         return
     end
 
@@ -1211,7 +1212,8 @@ function FastReader:startRSVP(opts)
     end
     
     self.rsvp_enabled = true
-    self.rsvp_paused = false
+    -- Always open paused on the start word: tap to play, long press to close
+    self.rsvp_paused = true
     self.current_chunk_index = 1
 
     -- A tapped word overrides the saved resume position
@@ -1235,9 +1237,8 @@ function FastReader:startRSVP(opts)
     
     logger.info("FastReader: RSVP interval set to " .. (60000 / self.rsvp_speed) .. "ms for " .. self.rsvp_speed .. " WPM")
 
-    -- Show first word, then schedule: the widget must exist to know whether it's hyphenated
+    -- Show the first word paused; resumeRSVP schedules the first tick when the user taps
     self:showRSVPWord(self.words[self.current_word_index])
-    self:scheduleNextTick()
 
     logger.info("FastReader: RSVP started successfully")
 end
