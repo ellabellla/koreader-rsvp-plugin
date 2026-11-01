@@ -58,7 +58,10 @@ Reading on 400 words per second
 - **Tap on Text to Launch RSVP**: Enable/disable tap-to-start functionality
 - **Show Reading Position**: Toggle position indicator when resuming
 - **Preview Words**: Set number of words to display (1-10)
-- **Optimal Alignment (OVP)**: Align words around the focus crosshair (monospace) or center them with standard spacing
+- **Optimal Alignment (OVP)**: Align each word's focus letter (chosen with the OpenSpritz rule, about a third of the way into the word) under a fixed crosshair, or left-align words with standard spacing
+- **OVP Offset**: Distance of the crosshair from the left edge, in average letter widths of the RSVP font (2-10, default 6.5). 6.5 fits the start of nearly every word
+- **Hyphenate Long Words**: Words too long for the widget are split into hyphenated parts shown one after another, at the word's own hyphens or the book's hyphenation dictionary break points (on by default)
+- **Split Hyphenated Words**: Compound words are shown part by part (`well-` then `known`), splitting at hyphens and em dashes, for easier reading. Words with a one-letter part such as `e-mail` stay whole (on by default)
 - **Pause on Punctuation**: Show punctuation and hold words ending in `. , ; : ! ? … —` longer. Spaced-out ellipses (`wait . . .`) are grouped with their word. Abbreviations such as `Mr.` also pause
 - **Punctuation Pause**: How much longer those words stay on screen (1.0-4.0×, default 1.5×)
 - **Font**: Font for the RSVP widget. Lists the same fonts as the book font menu, plus Default (monospace with OVP on, the UI font with OVP off). Thin or light fonts can look ragged while words are playing on e-ink, and clean when paused

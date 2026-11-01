@@ -110,6 +110,8 @@ local function splitWords(text)
     if type(text) ~= "string" then
         return words
     end
+    -- Soft hyphens (U+00AD) are invisible break hints from the book's text
+    text = text:gsub("\194\173", "")
     local pending_prefix = ""
     for token in text:gmatch("%S+") do
         if stripPunctuation(token) ~= "" then
@@ -171,6 +173,7 @@ function FastReader:init()
     self.tap_to_launch_enabled = self.settings:readSetting("tap_to_launch_enabled") or false
     self.rsvp_speed = self.settings:readSetting("rsvp_speed") or 250  -- words per minute
     self.current_word_index = 1
+    self.current_chunk_index = 1
     self.words = {}
     self.original_view_mode = nil
     
@@ -192,6 +195,21 @@ function FastReader:init()
     -- RSVP font: a crengine face name, or nil for the built-in default fonts
     self.rsvp_font_face = self.settings:readSetting("rsvp_font_face")
     self.rsvp_font_size = self.settings:readSetting("rsvp_font_size") or 28
+
+    -- OVP crosshair distance from the left margin, in wide-letter widths
+    self.ovp_offset_letters = self.settings:readSetting("ovp_offset_letters") or 6.5
+    local hyphenate_setting = self.settings:readSetting("hyphenate_long_words")
+    if hyphenate_setting == nil then
+        self.hyphenate_long_words = true
+    else
+        self.hyphenate_long_words = hyphenate_setting
+    end
+    local split_setting = self.settings:readSetting("split_hyphenated_words")
+    if split_setting == nil then
+        self.split_hyphenated_words = true
+    else
+        self.split_hyphenated_words = split_setting
+    end
 
     -- Position tracking for resume functionality
     self.last_page_hash = nil -- Hash to identify current page content
@@ -218,6 +236,9 @@ function FastReader:saveSettings()
         self.settings:saveSetting("punctuation_pause_multiplier", self.punctuation_pause_multiplier)
         self.settings:saveSetting("rsvp_font_face", self.rsvp_font_face)
         self.settings:saveSetting("rsvp_font_size", self.rsvp_font_size)
+        self.settings:saveSetting("ovp_offset_letters", self.ovp_offset_letters)
+        self.settings:saveSetting("hyphenate_long_words", self.hyphenate_long_words)
+        self.settings:saveSetting("split_hyphenated_words", self.split_hyphenated_words)
         self.settings:flush()
     end
 end
@@ -458,22 +479,15 @@ function FastReader:extractWordsFromCurrentPage()
     return words
 end
 
+-- Focus letter position for a word of char_count letters (OpenSpritz pivot table)
 local function getOptimalRecognitionIndex(char_count)
     if char_count <= 1 then
         return 1
-    elseif char_count == 2 then
-        return 1
-    elseif char_count == 3 then
+    elseif char_count <= 5 then
         return 2
-    elseif char_count == 4 then
-        return 2
-    elseif char_count == 5 then
+    elseif char_count <= 9 then
         return 3
-    elseif char_count == 6 then
-        return 3
-    elseif char_count == 7 then
-        return 4
-    elseif char_count == 8 then
+    elseif char_count <= 13 then
         return 4
     end
     return 5
@@ -521,6 +535,179 @@ local function calculateAnchorOffset(word, face, bold)
     local key_width = measureTextWidth(face, key_char, bold)
 
     return prefix_width + (key_width / 2), ovp_index
+end
+
+-- Positions in `core` (a list of characters) after which a word may be broken:
+-- after its own hyphens, and at dictionary break points from `hyphenate`,
+-- which returns a hyphen-separated hyphenation of a hyphen-free segment
+local function findBreakPoints(core, hyphenate)
+    local breaks = {}
+    local seg_start = 1
+    for i = 1, #core + 1 do
+        if i > #core or core[i] == "-" then
+            local seg_len = i - seg_start
+            if hyphenate and seg_len >= 4 then
+                local segment = table.concat(core, "", seg_start, i - 1)
+                local hyphenated = hyphenate(segment)
+                if type(hyphenated) == "string" then
+                    -- Align the hyphenated string with the segment; give up on any mismatch
+                    local seg_breaks = {}
+                    local j = seg_start - 1
+                    local aligned = true
+                    for _, ch in ipairs(util.splitToChars(hyphenated)) do
+                        if j < i - 1 and ch == core[j + 1] then
+                            j = j + 1
+                        elseif ch == "-" and j >= seg_start and j < i - 1 then
+                            seg_breaks[j] = true
+                        else
+                            aligned = false
+                            break
+                        end
+                    end
+                    if aligned and j == i - 1 then
+                        for pos in pairs(seg_breaks) do
+                            breaks[pos] = true
+                        end
+                    end
+                end
+            end
+            if i < #core then
+                breaks[i] = true -- after an existing hyphen
+            end
+            seg_start = i + 1
+        end
+    end
+    return breaks
+end
+
+-- Characters that join the parts of a compound word ("well-known", "word—word")
+local COMPOUND_SEPARATORS = charSet{ "-", "—" }
+
+-- Split a hyphenated compound into its parts for easier reading:
+-- "mother-in-law" -> "mother-", "in-", "law". Runs of separators ("word--word")
+-- count as one break. A break is skipped when either side has fewer than 2
+-- letters, so "e-mail" and "T-shirt" stay whole. Leading punctuation stays on
+-- the first part, trailing punctuation on the last.
+local function splitCompound(word)
+    local chars = util.splitToChars(word)
+    local lead = 0
+    while lead < #chars and isPunctuationChar(chars[lead + 1]) do
+        lead = lead + 1
+    end
+    local trail = 0
+    while trail < #chars - lead and isPunctuationChar(chars[#chars - trail]) do
+        trail = trail + 1
+    end
+
+    -- Segments of the core, each with the separator run that follows it
+    local segments = {}
+    local current = { text = {}, letters = 0, sep = {} }
+    for i = lead + 1, #chars - trail do
+        local ch = chars[i]
+        if COMPOUND_SEPARATORS[ch] then
+            table.insert(current.sep, ch)
+        else
+            if #current.sep > 0 then
+                table.insert(segments, current)
+                current = { text = {}, letters = 0, sep = {} }
+            end
+            table.insert(current.text, ch)
+            if not isPunctuationChar(ch) then
+                current.letters = current.letters + 1
+            end
+        end
+    end
+    table.insert(segments, current)
+    if #segments < 2 then
+        return { word }
+    end
+
+    local pieces = {}
+    local piece = table.concat(chars, "", 1, lead)
+    for k, seg in ipairs(segments) do
+        piece = piece .. table.concat(seg.text) .. table.concat(seg.sep)
+        local next_seg = segments[k + 1]
+        if next_seg and seg.letters >= 2 and next_seg.letters >= 2 then
+            table.insert(pieces, piece)
+            piece = ""
+        end
+    end
+    table.insert(pieces, piece .. table.concat(chars, "", #chars - trail + 1, #chars))
+    return pieces
+end
+
+local MIN_LAST_CHUNK = 3
+
+-- Split a word that doesn't fit into hyphenated chunks that do.
+-- fits(text) says whether a chunk fits in the widget; hyphenate(segment) returns
+-- dictionary break points (or nil). Leading punctuation stays on the first chunk,
+-- trailing punctuation on the last.
+local function chunkWord(word, fits, hyphenate)
+    if fits(word) then
+        return { word }
+    end
+    local chars = util.splitToChars(word)
+    local lead = 0
+    while lead < #chars and isPunctuationChar(chars[lead + 1]) do
+        lead = lead + 1
+    end
+    local trail = 0
+    while trail < #chars - lead and isPunctuationChar(chars[#chars - trail]) do
+        trail = trail + 1
+    end
+    local prefix = table.concat(chars, "", 1, lead)
+    local suffix = table.concat(chars, "", #chars - trail + 1, #chars)
+    local core = {}
+    for i = lead + 1, #chars - trail do
+        table.insert(core, chars[i])
+    end
+    if #core < MIN_LAST_CHUNK + 1 then
+        return { word }
+    end
+
+    local breaks = findBreakPoints(core, hyphenate)
+    local chunks = {}
+    local start = 1
+    while start <= #core do
+        local head = (start == 1) and prefix or ""
+        local rest = head .. table.concat(core, "", start, #core) .. suffix
+        if fits(rest) then
+            table.insert(chunks, rest)
+            break
+        end
+
+        local function candidate(p)
+            local piece = head .. table.concat(core, "", start, p)
+            if core[p] ~= "-" then
+                piece = piece .. "-"
+            end
+            return piece
+        end
+        -- Longest piece ending at a preferred break point, leaving at least MIN_LAST_CHUNK letters
+        local best
+        for p = #core - MIN_LAST_CHUNK, start + 1, -1 do
+            if breaks[p] and fits(candidate(p)) then
+                best = p
+                break
+            end
+        end
+        -- Otherwise break between any two letters
+        if not best then
+            for p = #core - MIN_LAST_CHUNK, start, -1 do
+                if fits(candidate(p)) then
+                    best = p
+                    break
+                end
+            end
+        end
+        -- Nothing fits (very narrow widget): take one letter so we always make progress
+        if not best then
+            best = start
+        end
+        table.insert(chunks, candidate(best))
+        start = best + 1
+    end
+    return chunks
 end
 
 local RSVPWidget = InputContainer:extend{
@@ -581,6 +768,10 @@ function RSVPWidget:updateDimensions(new_dimen)
     end
     self.anchor_face = anchor_face
     self.secondary_face = secondary_face
+    -- Average lowercase letter width in the current word's font, the unit for the OVP offset
+    local alphabet = "abcdefghijklmnopqrstuvwxyz"
+    self.letter_w = measureTextWidth(anchor_face, alphabet, true) / #alphabet
+    self.chunk_cache = {}
 
     self.ges_events = {
         Tap = {
@@ -650,6 +841,84 @@ function RSVPWidget:freeWidgets()
         end
         self.word_widgets = {}
     end
+    self.chunk_cache = {}
+end
+
+-- Box-wide layout values shared by painting and the chunk fit check
+function RSVPWidget:getLayout()
+    local inner_w = self.box_dimen.w - (self.text_padding * 2)
+    local preview_count = self.plugin.words_preview_count or 3
+    local size_scale = self.size_scale or 1
+    local min_left_padding = Screen:scaleBySize(20)
+    local base_right_padding = Screen:scaleBySize(((preview_count <= 2) and 140 or 180) * size_scale)
+    base_right_padding = math.max(Screen:scaleBySize(80 * size_scale), math.min(base_right_padding, math.floor(inner_w * 0.6)))
+
+    local anchor_target
+    if self.plugin.ovp_alignment_enabled then
+        -- Crosshair sits ovp_offset_letters average letter widths from the inner edge,
+        -- measured in the current font/size so it stays fixed for every word
+        anchor_target = math.floor(self.plugin.ovp_offset_letters * self.letter_w + 0.5)
+        anchor_target = math.min(anchor_target, math.floor(inner_w * 0.75))
+    end
+
+    return {
+        inner_w = inner_w,
+        min_left_padding = min_left_padding,
+        base_right_padding = base_right_padding,
+        anchor_target = anchor_target,
+        fixed_leading = math.max(math.floor((inner_w - base_right_padding) * 0.2), min_left_padding),
+    }
+end
+
+-- Anchor offset and left padding for the current word's text
+function RSVPWidget:layoutCurrent(text, layout)
+    if self.plugin.ovp_alignment_enabled then
+        local anchor_offset = calculateAnchorOffset(text, self.anchor_face, true)
+        -- The offset is measured from the inner edge (the box padding already clears the border),
+        -- so only clamp at that edge
+        return anchor_offset, math.max(layout.anchor_target - anchor_offset, 0)
+    end
+    return 0, layout.fixed_leading
+end
+
+-- Words keep their punctuation only when punctuation pauses are enabled
+function RSVPWidget:displayText(word)
+    return self.plugin.punctuation_pause_enabled and word or stripPunctuation(word)
+end
+
+-- The displayed chunks of a word: the word itself, its compound parts
+-- ("well-" / "known"), and hyphenated parts of anything too long to fit
+function RSVPWidget:getChunks(text)
+    local split_compounds = self.plugin.split_hyphenated_words
+    local hyphenate = self.plugin.hyphenate_long_words
+    if not split_compounds and not hyphenate then
+        return { text }
+    end
+    local chunks = self.chunk_cache[text]
+    if not chunks then
+        local pieces = split_compounds and splitCompound(text) or { text }
+        if hyphenate then
+            local layout = self:getLayout()
+            local function fits(t)
+                local _, leading = self:layoutCurrent(t, layout)
+                -- Small safety margin: the drawn TextWidget can be a pixel or two wider than this measurement
+                return leading + measureTextWidth(self.anchor_face, t, true) <= layout.inner_w - Screen:scaleBySize(2)
+            end
+            local function dictionary(segment)
+                return self.plugin:getHyphenation(segment)
+            end
+            chunks = {}
+            for _, piece in ipairs(pieces) do
+                for _, chunk in ipairs(chunkWord(piece, fits, dictionary)) do
+                    table.insert(chunks, chunk)
+                end
+            end
+        else
+            chunks = pieces
+        end
+        self.chunk_cache[text] = chunks
+    end
+    return chunks
 end
 
 function RSVPWidget:getWordWidget(idx)
@@ -692,51 +961,27 @@ function RSVPWidget:paintTo(bb, x, y)
         return
     end
 
-    -- Words keep their punctuation only when punctuation pauses are enabled
-    local show_punctuation = self.plugin.punctuation_pause_enabled
-    local function displayWord(word)
-        return show_punctuation and word or stripPunctuation(word)
-    end
-
-    local current_word = displayWord(self.words[self.current_index])
+    -- Current item: the word, or the current hyphenated chunk of a long word
+    local chunks = self:getChunks(self:displayText(self.words[self.current_index]))
+    local current_word = chunks[math.min(self.plugin.current_chunk_index or 1, #chunks)]
     local preview_count = self.plugin.words_preview_count or 3
 
     -- Gather preview words (current + next words)
-    local preview_words = {}
-    for i = 0, preview_count - 1 do
+    local preview_words = { current_word }
+    for i = 1, preview_count - 1 do
         local idx = self.current_index + i
         if idx <= #self.words then
-            table.insert(preview_words, displayWord(self.words[idx]))
+            table.insert(preview_words, self:displayText(self.words[idx]))
         end
     end
 
     local anchor_face = self.anchor_face
     local inter_word_gap = self.inter_word_gap
-    local min_left_padding = Screen:scaleBySize(20)
     local size_scale = self.size_scale or 1
-    local base_right_padding = Screen:scaleBySize(((preview_count <= 2) and 140 or 180) * size_scale)
-    base_right_padding = math.max(Screen:scaleBySize(80 * size_scale), math.min(base_right_padding, math.floor(inner_w * 0.6)))
-
-    local anchor_offset = 0
-    if self.plugin.ovp_alignment_enabled then
-        anchor_offset = calculateAnchorOffset(current_word, anchor_face, true)
-    end
-
-    local anchor_target
-    if self.plugin.ovp_alignment_enabled then
-        local target_limit = Screen:scaleBySize(((preview_count <= 2) and 90 or 140) * size_scale)
-        anchor_target = math.min(inner_w - base_right_padding, target_limit)
-        anchor_target = math.max(anchor_target, Screen:scaleBySize(90 * size_scale))
-    else
-        anchor_target = math.floor(inner_w / 2)
-    end
-
-    local leading_padding
-    if self.plugin.ovp_alignment_enabled then
-        leading_padding = math.max(anchor_target - anchor_offset, min_left_padding)
-    else
-        leading_padding = math.max(math.floor((inner_w - base_right_padding) * 0.2), min_left_padding)
-    end
+    local layout = self:getLayout()
+    local min_left_padding = layout.min_left_padding
+    local base_right_padding = layout.base_right_padding
+    local anchor_offset, leading_padding = self:layoutCurrent(current_word, layout)
 
     -- Setup current word widget (always slot 1)
     local current_widget = self:getWordWidget(1)
@@ -855,13 +1100,37 @@ function FastReader:onScreenResize(dimen)
     end
 end
 
+-- Displayed chunks of the current word (more than one when it's hyphenated)
+function FastReader:getCurrentChunks()
+    local word = self.words[self.current_word_index]
+    if not word or not self.rsvp_widget then
+        return { word }
+    end
+    return self.rsvp_widget:getChunks(self.rsvp_widget:displayText(word))
+end
+
+-- Dictionary hyphenation of a word segment ("in-ter-na-tion-al"), or nil if unavailable
+function FastReader:getHyphenation(segment)
+    local ok, result = pcall(function()
+        local cre = require("document/credocument"):engineInit()
+        return cre.getHyphenationForWord(segment)
+    end)
+    if ok and type(result) == "string" then
+        return result
+    end
+    return nil
+end
+
 function FastReader:scheduleNextTick()
     if self.rsvp_timer then
         UIManager:unschedule(self.rsvp_timer)
         self.rsvp_timer = nil
     end
-    local interval = 60 / self.rsvp_speed  -- seconds per word
-    if self.punctuation_pause_enabled and endsWithPausePunctuation(self.words[self.current_word_index]) then
+    local interval = 60 / self.rsvp_speed  -- seconds per word (or per chunk of a hyphenated word)
+    -- Only the last chunk of a hyphenated word carries its real trailing punctuation
+    local is_last_chunk = self.current_chunk_index >= #self:getCurrentChunks()
+    if self.punctuation_pause_enabled and is_last_chunk
+            and endsWithPausePunctuation(self.words[self.current_word_index]) then
         interval = interval * self.punctuation_pause_multiplier
     end
     self.rsvp_timer = function()
@@ -943,6 +1212,7 @@ function FastReader:startRSVP(opts)
     
     self.rsvp_enabled = true
     self.rsvp_paused = false
+    self.current_chunk_index = 1
 
     -- A tapped word overrides the saved resume position
     local tapped_index = opts.start_pos and self:getWordIndexAtPosition(opts.start_pos)
@@ -964,11 +1234,11 @@ function FastReader:startRSVP(opts)
     end
     
     logger.info("FastReader: RSVP interval set to " .. (60000 / self.rsvp_speed) .. "ms for " .. self.rsvp_speed .. " WPM")
+
+    -- Show first word, then schedule: the widget must exist to know whether it's hyphenated
+    self:showRSVPWord(self.words[self.current_word_index])
     self:scheduleNextTick()
 
-    -- Show first word
-    self:showRSVPWord(self.words[self.current_word_index])
-    
     logger.info("FastReader: RSVP started successfully")
 end
 
@@ -1019,7 +1289,16 @@ function FastReader:rsvpTick()
         return
     end
 
+    -- Show the next chunk of a hyphenated word before moving on
+    if self.current_chunk_index < #self:getCurrentChunks() then
+        self.current_chunk_index = self.current_chunk_index + 1
+        self:showRSVPWord(self.words[self.current_word_index])
+        self:scheduleNextTick()
+        return
+    end
+
     self.current_word_index = self.current_word_index + 1
+    self.current_chunk_index = 1
 
     if self.current_word_index <= #self.words then
         self:showRSVPWord(self.words[self.current_word_index])
@@ -1100,6 +1379,7 @@ function FastReader:continueRSVPWithNewPage()
     if #new_words > 0 then
         self.words = new_words
         self.current_word_index = 1
+        self.current_chunk_index = 1
         -- Reset position tracking for new page
         self.last_page_hash = nil
         self.last_word_index = 1
@@ -1206,6 +1486,59 @@ function FastReader:addToMainMenu(menu_items)
                     end
                 end,
                 help_text = _("Aligns each word to its optimal recognition point and shows the subtle crosshair guide."),
+            },
+            {
+                text_func = function()
+                    return T(_("OVP Offset: %1 letters"), string.format("%.1f", self.ovp_offset_letters))
+                end,
+                enabled_func = function()
+                    return self.ovp_alignment_enabled
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    local spin_widget = SpinWidget:new{
+                        title_text = _("OVP Offset"),
+                        info_text = _("Distance of the focus crosshair from the left edge, in average letter widths (2.0-10.0)"),
+                        width = math.floor(Screen:getWidth() * 0.6),
+                        value = self.ovp_offset_letters,
+                        value_min = 2.0,
+                        value_max = 10.0,
+                        value_step = 0.5,
+                        value_hold_step = 1.0,
+                        precision = "%.1f",
+                        default_value = 6.5,
+                        callback = function(spin)
+                            self.ovp_offset_letters = math.floor(spin.value * 10 + 0.5) / 10
+                            self:saveSettings()
+                            touchmenu_instance:updateItems()
+                        end
+                    }
+                    UIManager:show(spin_widget)
+                end,
+                help_text = _("How far the focus crosshair sits from the left edge, measured in average letter widths of the RSVP font. 6.5 fits the start of nearly every word, including one with a leading quote. Smaller values leave more room on the right, but words with long starts may shift."),
+            },
+            {
+                text = _("Hyphenate Long Words"),
+                checked_func = function()
+                    return self.hyphenate_long_words
+                end,
+                callback = function()
+                    self.hyphenate_long_words = not self.hyphenate_long_words
+                    self:saveSettings()
+                end,
+                help_text = _("Splits words too long for the RSVP widget into hyphenated parts shown one after another, using the book's hyphenation dictionary."),
+            },
+            {
+                text = _("Split Hyphenated Words"),
+                checked_func = function()
+                    return self.split_hyphenated_words
+                end,
+                callback = function()
+                    self.split_hyphenated_words = not self.split_hyphenated_words
+                    self:saveSettings()
+                end,
+                help_text = _("Shows the parts of hyphenated compound words one after another (well- / known), splitting at hyphens and em dashes. Words with a one-letter part, like e-mail, stay whole."),
             },
             {
                 text = _("Pause on Punctuation"),
@@ -1468,6 +1801,7 @@ function FastReader:onKeyPress(key)
         -- Go to previous word
         if self.current_word_index > 1 then
             self.current_word_index = self.current_word_index - 1
+            self.current_chunk_index = 1
             self:showRSVPWord(self.words[self.current_word_index])
         end
         return true
