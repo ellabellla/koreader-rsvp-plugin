@@ -4,7 +4,8 @@ A powerful RSVP (Rapid Serial Visual Presentation) plugin that enables speed rea
 
 ## Features
 
-- Tap-to-Launch RSVP: Tap directly on text to instantly start RSVP reading
+- Tap-to-Launch RSVP: Tap a word to start RSVP reading from that word
+- Tap to Pause/Play: Tap the screen to pause, tap again to continue; long press while paused to stop
 - Resume Reading: Automatically remembers your last reading position on each page
 - Flexible Speed Control: Adjustable reading speed from 50 to 1000 WPM
 - Multi-Word Preview: Display multiple words simultaneously (1-10 words configurable)
@@ -34,18 +35,19 @@ Reading on 400 words per second
 1. **Enable Tap-to-Launch**: Settings → FastReader → "Tap on Text to Launch RSVP"
 2. **Set your speed**: Settings → FastReader → "RSVP Speed"
 3. *(Optional)* Enable or disable the "Optimal Alignment (OVP)" toggle to choose between centered words and crosshair alignment
-4. **Tap on any text** to start speed reading
-5. **Tap the reading widget** to stop
+4. **Tap on any word** to start speed reading from that word
+5. **Tap** to pause, **tap** again to continue
+6. **Long press while paused** to stop
 
 ### Manual Start
 - Go to Settings → FastReader → "Start/Stop RSVP"
 - Or use the assigned gesture if configured
 
 ### Controls During Reading
-- **Tap anywhere on the reading widget** to stop RSVP
-- **Menu/Back button** to stop RSVP
-- **Page forward/back** to navigate (if RSVP is paused)
-- **Tap elsewhere** to stop and return to normal reading
+- **Tap anywhere** to pause; tap again to continue
+- **Long press while paused** to stop and return to normal reading
+- **Menu/Back button** to stop RSVP at any time
+- **Press (d-pad/keyboard)** to pause/continue
 
 ## Settings
 

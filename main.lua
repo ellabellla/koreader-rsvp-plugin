@@ -39,6 +39,43 @@ local FastReader = WidgetContainer:extend{
     is_doc_only = true,
 }
 
+-- Split text into words, removing leading/trailing punctuation.
+-- Shared by page extraction and tap-position lookup so word indices agree.
+local function splitWords(text)
+    local words = {}
+    if type(text) ~= "string" then
+        return words
+    end
+    for token in text:gmatch("%S+") do
+        local word = token:gsub("^[%p]*", ""):gsub("[%p]*$", "")
+        if word ~= "" then
+            table.insert(words, word)
+        end
+    end
+    return words
+end
+
+-- Flatten a getPageText() result (table of lines of word boxes) into a string
+local function flattenPageText(page_text)
+    if type(page_text) == "string" then
+        return page_text
+    end
+    if type(page_text) ~= "table" then
+        return ""
+    end
+    local parts = {}
+    for _, line in ipairs(page_text) do
+        if type(line) == "table" then
+            for _, box in ipairs(line) do
+                if type(box) == "table" and box.word then
+                    table.insert(parts, box.word)
+                end
+            end
+        end
+    end
+    return table.concat(parts, " ")
+end
+
 function FastReader:onDispatcherRegisterActions()
     Dispatcher:registerAction("fastreader_action", {category="none", event="FastReader", title=_("Fast Reader"), general=true,})
     Dispatcher:registerAction("fastreader_rsvp", {category="none", event="FastReaderRSVP", title=_("RSVP Reading"), general=true,})
@@ -54,6 +91,7 @@ function FastReader:init()
     
     -- RSVP state
     self.rsvp_enabled = false
+    self.rsvp_paused = false
     self.rsvp_timer = nil
     self.pending_resume_task = nil
     self.rsvp_widget = nil
@@ -204,15 +242,37 @@ function FastReader:extractWordsFromCurrentPage()
         table.insert(debug_info, "Document type: paging (PDF/DjVu/etc), page: " .. tostring(page))
         logger.info("FastReader: Paging document, page: " .. tostring(page))
         
-        if page and self.ui.document.getPageText then
-            local success, page_text = pcall(self.ui.document.getPageText, self.ui.document, page)
-            if success and page_text and page_text ~= "" then
+        -- Use getTextFromPositions over the whole page, the same call used to locate
+        -- a tapped word, so word order and indices stay consistent
+        if page then
+            local success, page_text = pcall(function()
+                local dims = self.ui.document:getNativePageDimensions(page)
+                local res = self.ui.document:getTextFromPositions(
+                    {x = 0, y = 0, page = page},
+                    {x = dims.w, y = dims.h, page = page}
+                )
+                return res and res.text
+            end)
+            if success and type(page_text) == "string" and page_text ~= "" then
                 text = page_text
-                table.insert(debug_info, "SUCCESS: getPageText returned " .. string.len(page_text) .. " chars")
+                table.insert(debug_info, "SUCCESS: getTextFromPositions returned " .. string.len(page_text) .. " chars")
                 logger.info("FastReader: Successfully extracted " .. string.len(page_text) .. " characters")
             else
-                table.insert(debug_info, "FAILED: getPageText - " .. tostring(page_text))
-                logger.warn("FastReader: getPageText failed: " .. tostring(page_text))
+                table.insert(debug_info, "FAILED: getTextFromPositions - " .. tostring(page_text))
+                logger.warn("FastReader: getTextFromPositions failed: " .. tostring(page_text))
+            end
+        end
+
+        if text == "" and page and self.ui.document.getPageText then
+            local success, page_text = pcall(self.ui.document.getPageText, self.ui.document, page)
+            page_text = success and flattenPageText(page_text) or ""
+            if page_text ~= "" then
+                text = page_text
+                table.insert(debug_info, "SUCCESS: getPageText returned " .. string.len(page_text) .. " chars")
+                logger.info("FastReader: getPageText fallback extracted " .. string.len(page_text) .. " characters")
+            else
+                table.insert(debug_info, "FAILED: getPageText fallback")
+                logger.warn("FastReader: getPageText fallback failed")
             end
         end
     else
@@ -235,16 +295,8 @@ function FastReader:extractWordsFromCurrentPage()
         return {}
     end
     
-    -- Split text into words, removing punctuation and extra spaces
-    local words = {}
-    for word in text:gmatch("%S+") do
-        -- Clean up word (remove some punctuation but keep basic structure)
-        word = word:gsub("^[%p]*", ""):gsub("[%p]*$", "")
-        if word and word ~= "" then
-            table.insert(words, word)
-        end
-    end
-    
+    local words = splitWords(text)
+
     logger.info("FastReader: Successfully extracted " .. #words .. " words")
     return words
 end
@@ -309,6 +361,7 @@ function RSVPWidget:init()
     if Device:hasKeys() then
         self.key_events = {
             Close = { { "Back" }, doc = "close RSVP reader" },
+            TogglePause = { { "Press" }, doc = "pause/resume RSVP reader" },
         }
     end
 end
@@ -347,6 +400,12 @@ function RSVPWidget:updateDimensions(new_dimen)
         Tap = {
             GestureRange:new{ ges = "tap", range = self.dimen }
         },
+        Hold = {
+            GestureRange:new{ ges = "hold", range = self.dimen }
+        },
+        HoldRelease = {
+            GestureRange:new{ ges = "hold_release", range = self.dimen }
+        },
     }
 end
 
@@ -372,7 +431,24 @@ function RSVPWidget:onScreenResize(dimen)
 end
 
 function RSVPWidget:onTap(arg, ges)
-    self.plugin:stopRSVP()
+    self.plugin:togglePause()
+    return true
+end
+
+function RSVPWidget:onHold(arg, ges)
+    -- Long press only stops once paused, so a stray hold while reading is harmless
+    if self.plugin.rsvp_paused then
+        self.plugin:stopRSVP()
+    end
+    return true
+end
+
+function RSVPWidget:onHoldRelease(arg, ges)
+    return true
+end
+
+function RSVPWidget:onTogglePause()
+    self.plugin:togglePause()
     return true
 end
 
@@ -586,7 +662,64 @@ function FastReader:onScreenResize(dimen)
     end
 end
 
-function FastReader:startRSVP()
+function FastReader:scheduleNextTick()
+    if self.rsvp_timer then
+        UIManager:unschedule(self.rsvp_timer)
+        self.rsvp_timer = nil
+    end
+    local interval = 60 / self.rsvp_speed  -- seconds per word
+    self.rsvp_timer = function()
+        self.rsvp_timer = nil
+        self:rsvpTick()
+    end
+    UIManager:scheduleIn(interval, self.rsvp_timer)
+end
+
+function FastReader:pauseRSVP()
+    if not self.rsvp_enabled or self.rsvp_paused then
+        return
+    end
+    self.rsvp_paused = true
+    -- Cancel any queued tick so no word slips by after the tap
+    if self.rsvp_timer then
+        UIManager:unschedule(self.rsvp_timer)
+        self.rsvp_timer = nil
+    end
+    -- Words are drawn with "fast" (A2) refreshes, which leave ghosting. Redraw the
+    -- static paused word with a higher-quality "ui" refresh to clean it up.
+    if self.rsvp_widget then
+        UIManager:setDirty(self.rsvp_widget, "ui", self.rsvp_widget.box_dimen)
+    end
+    logger.info("FastReader: RSVP paused at word " .. self.current_word_index)
+end
+
+function FastReader:resumeRSVP()
+    if not self.rsvp_enabled or not self.rsvp_paused then
+        return
+    end
+    self.rsvp_paused = false
+    -- Flash the box so the "fast" (A2) word refreshes restart from a clean panel;
+    -- A2 drawn over residue from earlier refreshes leaves heavy ghosting
+    if self.rsvp_widget then
+        UIManager:setDirty(self.rsvp_widget, "flashui", self.rsvp_widget.box_dimen)
+    end
+    -- If a page turn is in flight, continueRSVPWithNewPage schedules the next tick
+    if not self.pending_resume_task then
+        self:scheduleNextTick()
+    end
+    logger.info("FastReader: RSVP resumed at word " .. self.current_word_index)
+end
+
+function FastReader:togglePause()
+    if self.rsvp_paused then
+        self:resumeRSVP()
+    else
+        self:pauseRSVP()
+    end
+end
+
+function FastReader:startRSVP(opts)
+    opts = opts or {}
     if self.rsvp_enabled then
         logger.info("FastReader: RSVP already enabled, ignoring start request")
         return
@@ -613,9 +746,15 @@ function FastReader:startRSVP()
     end
     
     self.rsvp_enabled = true
-    
-    -- Check if we can resume from last position on this page
-    if self:shouldResumeFromLastPosition() then
+    self.rsvp_paused = false
+
+    -- A tapped word overrides the saved resume position
+    local tapped_index = opts.start_pos and self:getWordIndexAtPosition(opts.start_pos)
+
+    if tapped_index then
+        self.current_word_index = tapped_index
+        logger.info("FastReader: Starting from tapped word " .. self.current_word_index .. " of " .. #self.words)
+    elseif self:shouldResumeFromLastPosition() then
         self.current_word_index = self.last_word_index
         logger.info("FastReader: Resuming from word " .. self.current_word_index .. " of " .. #self.words)
         
@@ -628,21 +767,9 @@ function FastReader:startRSVP()
         logger.info("FastReader: Starting from beginning")
     end
     
-    -- Calculate interval in milliseconds
-    local interval = 60000 / self.rsvp_speed  -- Convert WPM to milliseconds per word
-    logger.info("FastReader: RSVP interval set to " .. interval .. "ms for " .. self.rsvp_speed .. " WPM")
-    
-    -- Start RSVP timer
-    if self.rsvp_timer then
-        UIManager:unschedule(self.rsvp_timer)
-        self.rsvp_timer = nil
-    end
-    self.rsvp_timer = function()
-        self.rsvp_timer = nil
-        self:rsvpTick()
-    end
-    UIManager:scheduleIn(interval / 1000, self.rsvp_timer)
-    
+    logger.info("FastReader: RSVP interval set to " .. (60000 / self.rsvp_speed) .. "ms for " .. self.rsvp_speed .. " WPM")
+    self:scheduleNextTick()
+
     -- Show first word
     self:showRSVPWord(self.words[self.current_word_index])
     
@@ -662,7 +789,8 @@ function FastReader:stopRSVP()
     end
     
     self.rsvp_enabled = false
-    
+    self.rsvp_paused = false
+
     -- Stop timer
     if self.rsvp_timer then
         UIManager:unschedule(self.rsvp_timer)
@@ -678,7 +806,8 @@ function FastReader:stopRSVP()
     if self.rsvp_widget then
         self.rsvp_widget:freeWidgets()
         local refresh_region = self.rsvp_widget.box_dimen or self.rsvp_widget.dimen
-        UIManager:close(self.rsvp_widget, "ui", refresh_region)
+        -- Flash the box region on close to clear ghosting left by the "fast" word refreshes
+        UIManager:close(self.rsvp_widget, "flashui", refresh_region)
         self.rsvp_widget = nil
     end
     
@@ -687,35 +816,18 @@ function FastReader:stopRSVP()
     
     -- Restore original view mode
     self:restoreOriginalView()
-    
-    UIManager:show(InfoMessage:new{
-        text = _("RSVP stopped"),
-        timeout = 1.5,
-    })
 end
 
 function FastReader:rsvpTick()
-    if not self.rsvp_enabled or #self.words == 0 then
+    if not self.rsvp_enabled or self.rsvp_paused or #self.words == 0 then
         return
     end
-    
+
     self.current_word_index = self.current_word_index + 1
-    
+
     if self.current_word_index <= #self.words then
-        -- Show next word
         self:showRSVPWord(self.words[self.current_word_index])
-        
-        -- Schedule next tick
-        local interval = 60000 / self.rsvp_speed
-        if self.rsvp_timer then
-            UIManager:unschedule(self.rsvp_timer)
-            self.rsvp_timer = nil
-        end
-        self.rsvp_timer = function()
-            self.rsvp_timer = nil
-            self:rsvpTick()
-        end
-        UIManager:scheduleIn(interval / 1000, self.rsvp_timer)
+        self:scheduleNextTick()
     else
         -- End of current page reached, try to go to next page
         logger.info("FastReader: End of current page, attempting to go to next page")
@@ -799,18 +911,11 @@ function FastReader:continueRSVPWithNewPage()
         
         -- Continue with first word of new page
         self:showRSVPWord(self.words[self.current_word_index])
-        
-        -- Schedule next tick
-        local interval = 60000 / self.rsvp_speed
-        if self.rsvp_timer then
-            UIManager:unschedule(self.rsvp_timer)
-            self.rsvp_timer = nil
+
+        -- Stay paused if the user paused during the page turn
+        if not self.rsvp_paused then
+            self:scheduleNextTick()
         end
-        self.rsvp_timer = function()
-            self.rsvp_timer = nil
-            self:rsvpTick()
-        end
-        UIManager:scheduleIn(interval / 1000, self.rsvp_timer)
     else
         logger.warn("FastReader: No words extracted from new page, trying next page")
         -- Try one more page if this one is empty
@@ -1070,26 +1175,7 @@ function FastReader:onKeyPress(key)
         self:stopRSVP()
         return true
     elseif key == "Press" or key == "LPgFwd" then
-        -- Pause/resume RSVP
-        if self.rsvp_timer then
-            UIManager:unschedule(self.rsvp_timer)
-            self.rsvp_timer = nil
-            UIManager:show(InfoMessage:new{
-                text = _("RSVP paused"),
-                timeout = 1,
-            })
-        else
-            local interval = 60000 / self.rsvp_speed
-            self.rsvp_timer = function()
-                self.rsvp_timer = nil
-                self:rsvpTick()
-            end
-            UIManager:scheduleIn(interval / 1000, self.rsvp_timer)
-            UIManager:show(InfoMessage:new{
-                text = _("RSVP resumed"),
-                timeout = 1,
-            })
-        end
+        self:togglePause()
         return true
     elseif key == "LPgBack" then
         -- Go to previous word
@@ -1150,9 +1236,10 @@ function FastReader:onTapToLaunchRSVP(ges)
     end
     
     -- Check if we tapped on text area (similar to dictionary mode)
-    if self:isTapOnTextArea(ges) then
-        logger.info("FastReader: Tap on text area detected, launching RSVP")
-        self:startRSVP()
+    local pos = self:isTapOnTextArea(ges)
+    if pos then
+        logger.info("FastReader: Tap on text area detected, launching RSVP from tapped word")
+        self:startRSVP({ start_pos = pos })
         return true -- Consumed the tap, prevent other handlers
     end
     
@@ -1176,16 +1263,62 @@ function FastReader:isTapOnTextArea(ges)
         if self.ui.document and self.ui.view then
             local pos = self.ui.view:screenToPageTransform(ges.pos)
             if pos then
-                local text_result = self.ui.document:getTextFromPositions(pos, pos)
+                -- do_not_draw_selection: avoid leaving a crengine selection highlight
+                local text_result = self.ui.document:getTextFromPositions(pos, pos, true)
                 if text_result and text_result.text and text_result.text:match("%S") then
                     -- We have non-whitespace text at this position
-                    return true
+                    return pos
                 end
             end
         end
     end
-    
-    return false
+
+    return nil
+end
+
+-- Find the index in self.words of the word at a page position (from screenToPageTransform).
+-- Counts words in the text from the top of the page up to the position, then checks
+-- the result against the word under the finger. Returns nil if it can't be determined.
+function FastReader:getWordIndexAtPosition(pos)
+    if not pos or #self.words == 0 then
+        return nil
+    end
+
+    local ok, idx = pcall(function()
+        local doc = self.ui.document
+        local prefix
+        if self.ui.paging then
+            prefix = doc:getTextFromPositions({x = 0, y = 0, page = pos.page}, pos)
+        else
+            prefix = doc:getTextFromPositions({x = 0, y = 0}, pos, true)
+        end
+        if not prefix or not prefix.text then
+            return nil
+        end
+
+        local index = #splitWords(prefix.text)
+        index = math.max(1, math.min(index, #self.words))
+
+        -- Verify against the word under the finger; search nearby if the counts drifted
+        local wordbox = doc:getWordFromPosition(pos, true)
+        local tapped = wordbox and wordbox.word and splitWords(wordbox.word)[1]
+        if tapped and self.words[index] ~= tapped then
+            for offset = 1, 3 do
+                if self.words[index - offset] == tapped then
+                    return index - offset
+                elseif self.words[index + offset] == tapped then
+                    return index + offset
+                end
+            end
+        end
+        return index
+    end)
+
+    if ok then
+        return idx
+    end
+    logger.warn("FastReader: Could not locate tapped word: " .. tostring(idx))
+    return nil
 end
 
 function FastReader:getCurrentPageHash()
