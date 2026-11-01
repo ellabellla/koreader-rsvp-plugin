@@ -9,6 +9,7 @@ A powerful RSVP (Rapid Serial Visual Presentation) plugin that enables speed rea
 - Resume Reading: Automatically remembers your last reading position on each page
 - Flexible Speed Control: Adjustable reading speed from 50 to 1000 WPM
 - Multi-Word Preview: Display multiple words simultaneously (1-10 words configurable)
+- Pause on Punctuation: Shows punctuation and holds words ending in it longer (adjustable)
 - Optimal View Point Alignment: Optionally anchor each word on a focus crosshair for faster fixation
 - Fixed-Width Display: Stable reading widget that doesn't "jump" between words
 - Position Tracking: Visual indicator shows reading progress when resuming
@@ -57,6 +58,8 @@ Reading on 400 words per second
 - **Show Reading Position**: Toggle position indicator when resuming
 - **Preview Words**: Set number of words to display (1-10)
 - **Optimal Alignment (OVP)**: Align words around the focus crosshair (monospace) or center them with standard spacing
+- **Pause on Punctuation**: Show punctuation and hold words ending in `. , ; : ! ? … —` longer. Spaced-out ellipses (`wait . . .`) are grouped with their word. Abbreviations such as `Mr.` also pause
+- **Punctuation Pause**: How much longer those words stay on screen (1.0-4.0×, default 1.5×)
 - **RSVP Speed**: Comprehensive speed control options
 
 ### Speed Presets

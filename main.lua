@@ -39,17 +39,88 @@ local FastReader = WidgetContainer:extend{
     is_doc_only = true,
 }
 
--- Split text into words, removing leading/trailing punctuation.
--- Shared by page extraction and tap-position lookup so word indices agree.
+local function charSet(list)
+    local set = {}
+    for _, ch in ipairs(list) do
+        set[ch] = true
+    end
+    return set
+end
+
+-- Non-ASCII punctuation; ASCII punctuation is matched with %p
+local UNICODE_PUNCTUATION = charSet{
+    "…", "—", "–", "“", "”", "‘", "’", "«", "»",
+    "。", "！", "？", "，", "；", "：", "、",
+}
+-- A word ending in one of these is held longer
+local PAUSE_CHARS = charSet{
+    ".", "!", "?", "…", ",", ";", ":", "—", "–", "-",
+    "。", "！", "？", "，", "；", "：", "、",
+}
+-- Skipped when looking for a word's final punctuation, so `end."` pauses
+local CLOSING_CHARS = charSet{ '"', "'", ")", "]", "”", "’", "»" }
+-- Standalone tokens made only of these are attached to a neighbouring word
+local GROUPED_CHARS = charSet{ ".", "…", "-", "–", "—" }
+
+local function isPunctuationChar(ch)
+    return UNICODE_PUNCTUATION[ch] or (#ch == 1 and ch:match("^%p$") ~= nil)
+end
+
+-- Remove leading/trailing punctuation from a word
+local function stripPunctuation(word)
+    local chars = util.splitToChars(word)
+    local first, last = 1, #chars
+    while first <= last and isPunctuationChar(chars[first]) do
+        first = first + 1
+    end
+    while last >= first and isPunctuationChar(chars[last]) do
+        last = last - 1
+    end
+    return table.concat(chars, "", first, last)
+end
+
+local function isGroupedToken(token)
+    for _, ch in ipairs(util.splitToChars(token)) do
+        if not GROUPED_CHARS[ch] then
+            return false
+        end
+    end
+    return true
+end
+
+-- Whether a word ends in punctuation that should hold it on screen longer
+local function endsWithPausePunctuation(word)
+    if not word or word == "" then
+        return false
+    end
+    local chars = util.splitToChars(word)
+    local i = #chars
+    while i > 0 and CLOSING_CHARS[chars[i]] do
+        i = i - 1
+    end
+    return i > 0 and PAUSE_CHARS[chars[i]] == true
+end
+
+-- Split text into words, keeping their punctuation. Standalone ellipses and
+-- dashes ("wait . . ." / "said —") are attached to the previous word; other
+-- punctuation-only tokens are dropped. Shared by page extraction and
+-- tap-position lookup so word indices agree.
 local function splitWords(text)
     local words = {}
     if type(text) ~= "string" then
         return words
     end
+    local pending_prefix = ""
     for token in text:gmatch("%S+") do
-        local word = token:gsub("^[%p]*", ""):gsub("[%p]*$", "")
-        if word ~= "" then
-            table.insert(words, word)
+        if stripPunctuation(token) ~= "" then
+            table.insert(words, pending_prefix .. token)
+            pending_prefix = ""
+        elseif isGroupedToken(token) then
+            if #words > 0 then
+                words[#words] = words[#words] .. token
+            else
+                pending_prefix = pending_prefix .. token
+            end
         end
     end
     return words
@@ -110,6 +181,14 @@ function FastReader:init()
         self.ovp_alignment_enabled = ovp_setting
     end
 
+    local punctuation_setting = self.settings:readSetting("punctuation_pause_enabled")
+    if punctuation_setting == nil then
+        self.punctuation_pause_enabled = true
+    else
+        self.punctuation_pause_enabled = punctuation_setting
+    end
+    self.punctuation_pause_multiplier = self.settings:readSetting("punctuation_pause_multiplier") or 1.5
+
     -- Position tracking for resume functionality
     self.last_page_hash = nil -- Hash to identify current page content
     self.last_word_index = 1  -- Last read word index on this page
@@ -131,6 +210,8 @@ function FastReader:saveSettings()
         self.settings:saveSetting("show_position_indicator", self.show_position_indicator)
         self.settings:saveSetting("words_preview_count", self.words_preview_count)
         self.settings:saveSetting("ovp_alignment_enabled", self.ovp_alignment_enabled)
+        self.settings:saveSetting("punctuation_pause_enabled", self.punctuation_pause_enabled)
+        self.settings:saveSetting("punctuation_pause_multiplier", self.punctuation_pause_multiplier)
         self.settings:flush()
     end
 end
@@ -341,7 +422,22 @@ local function calculateAnchorOffset(word, face, bold)
         return 0, 1
     end
 
-    local ovp_index = getOptimalRecognitionIndex(char_count)
+    -- Pick the focus letter from the word itself, ignoring surrounding punctuation
+    local lead = 0
+    while lead < char_count and isPunctuationChar(chars[lead + 1]) do
+        lead = lead + 1
+    end
+    local trail = 0
+    while trail < char_count - lead and isPunctuationChar(chars[char_count - trail]) do
+        trail = trail + 1
+    end
+    local core_count = char_count - lead - trail
+    local ovp_index
+    if core_count > 0 then
+        ovp_index = lead + getOptimalRecognitionIndex(core_count)
+    else
+        ovp_index = getOptimalRecognitionIndex(char_count)
+    end
     local prefix_text = table.concat(chars, "", 1, ovp_index - 1)
     local key_char = chars[ovp_index] or ""
 
@@ -506,7 +602,13 @@ function RSVPWidget:paintTo(bb, x, y)
         return
     end
 
-    local current_word = self.words[self.current_index]
+    -- Words keep their punctuation only when punctuation pauses are enabled
+    local show_punctuation = self.plugin.punctuation_pause_enabled
+    local function displayWord(word)
+        return show_punctuation and word or stripPunctuation(word)
+    end
+
+    local current_word = displayWord(self.words[self.current_index])
     local preview_count = self.plugin.words_preview_count or 3
 
     -- Gather preview words (current + next words)
@@ -514,7 +616,7 @@ function RSVPWidget:paintTo(bb, x, y)
     for i = 0, preview_count - 1 do
         local idx = self.current_index + i
         if idx <= #self.words then
-            table.insert(preview_words, self.words[idx])
+            table.insert(preview_words, displayWord(self.words[idx]))
         end
     end
 
@@ -668,6 +770,9 @@ function FastReader:scheduleNextTick()
         self.rsvp_timer = nil
     end
     local interval = 60 / self.rsvp_speed  -- seconds per word
+    if self.punctuation_pause_enabled and endsWithPausePunctuation(self.words[self.current_word_index]) then
+        interval = interval * self.punctuation_pause_multiplier
+    end
     self.rsvp_timer = function()
         self.rsvp_timer = nil
         self:rsvpTick()
@@ -1012,6 +1117,61 @@ function FastReader:addToMainMenu(menu_items)
                 help_text = _("Aligns each word to its optimal recognition point and shows the subtle crosshair guide."),
             },
             {
+                text = _("Pause on Punctuation"),
+                checked_func = function()
+                    return self.punctuation_pause_enabled
+                end,
+                callback = function()
+                    self.punctuation_pause_enabled = not self.punctuation_pause_enabled
+                    self:saveSettings()
+
+                    if self.punctuation_pause_enabled then
+                        UIManager:show(InfoMessage:new{
+                            text = _("Pause on punctuation enabled. Words show their punctuation and stay longer after it."),
+                            timeout = 3,
+                        })
+                    else
+                        UIManager:show(InfoMessage:new{
+                            text = _("Pause on punctuation disabled. Punctuation is hidden and every word gets the same time."),
+                            timeout = 3,
+                        })
+                    end
+                end,
+                help_text = _("Shows punctuation and holds words ending in punctuation (. , ; : ! ? … —) longer, by the punctuation pause multiplier."),
+            },
+            {
+                text_func = function()
+                    return T(_("Punctuation Pause: %1×"), string.format("%.1f", self.punctuation_pause_multiplier))
+                end,
+                enabled_func = function()
+                    return self.punctuation_pause_enabled
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    local spin_widget = SpinWidget:new{
+                        title_text = _("Punctuation Pause"),
+                        info_text = _("How much longer a word ending in punctuation stays on screen (1.0-4.0×)"),
+                        width = math.floor(Screen:getWidth() * 0.6),
+                        value = self.punctuation_pause_multiplier,
+                        value_min = 1.0,
+                        value_max = 4.0,
+                        value_step = 0.1,
+                        value_hold_step = 0.5,
+                        precision = "%.1f",
+                        default_value = 1.5,
+                        unit = "×",
+                        callback = function(spin)
+                            self.punctuation_pause_multiplier = math.floor(spin.value * 10 + 0.5) / 10
+                            self:saveSettings()
+                            touchmenu_instance:updateItems()
+                        end
+                    }
+                    UIManager:show(spin_widget)
+                end,
+                help_text = _("Multiplier applied to a word's display time when it ends in punctuation. 1.0 means no extra pause."),
+            },
+            {
                 text_func = function()
                     return T(_("Preview Words: %1"), self.words_preview_count)
                 end,
@@ -1301,12 +1461,16 @@ function FastReader:getWordIndexAtPosition(pos)
 
         -- Verify against the word under the finger; search nearby if the counts drifted
         local wordbox = doc:getWordFromPosition(pos, true)
-        local tapped = wordbox and wordbox.word and splitWords(wordbox.word)[1]
-        if tapped and self.words[index] ~= tapped then
+        -- Compare without punctuation: the document's word under the finger may not include it
+        local tapped = wordbox and wordbox.word and stripPunctuation(wordbox.word)
+        local function matches(i)
+            return self.words[i] ~= nil and stripPunctuation(self.words[i]) == tapped
+        end
+        if tapped and tapped ~= "" and not matches(index) then
             for offset = 1, 3 do
-                if self.words[index - offset] == tapped then
+                if matches(index - offset) then
                     return index - offset
-                elseif self.words[index + offset] == tapped then
+                elseif matches(index + offset) then
                     return index + offset
                 end
             end
