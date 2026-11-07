@@ -1192,6 +1192,14 @@ function FastReader:showRSVPWord(current_word)
 
     self.rsvp_widget:updateWord(self.words, self.current_word_index)
 
+    -- KOReader never waits on "fast" (A2) refreshes, so if the panel is slow (e.g. after
+    -- sleep or a long idle) a new word can start refreshing over the previous one and the
+    -- two smear together. Block until the last refresh (word or flash) has completed;
+    -- returns immediately when the panel is keeping up, NOP on non-MXCFB devices.
+    if UIManager.waitForVSync then
+        UIManager:waitForVSync()
+    end
+
     -- Use "fast" mode for smooth word updates
     UIManager:setDirty(self.rsvp_widget, "fast", self.rsvp_widget.box_dimen)
 end
@@ -1453,6 +1461,13 @@ function FastReader:togglePause()
     else
         self:pauseRSVP()
     end
+end
+
+-- Device going to sleep (cover closed / power button): pause so no words tick by
+-- unseen, and so no "fast" refreshes are sent over the screensaver. On wake the
+-- reader stays paused; tap to continue.
+function FastReader:onSuspend()
+    self:pauseRSVP()
 end
 
 function FastReader:startRSVP(opts)
